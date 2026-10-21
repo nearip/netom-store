@@ -1,5 +1,6 @@
 use crossbeam_epoch::Guard;
 use inetnum::addr::Prefix;
+use roaring::RoaringBitmap;
 use rand::prelude::*;
 
 use crate::{
@@ -845,6 +846,63 @@ impl<'a, M: Meta, C: Config> StarCastRib<M, C> {
         let (records_v6, emptied_v6) = self.v6.remove_mui(mui, guard)?;
 
         Ok((records_v4 + records_v6, emptied_v4 + emptied_v6))
+    }
+
+    /// Physically remove every record carrying any of `muis`, in one walk of
+    /// each address family instead of one walk per mui
+    /// ([`remove_mui`](Self::remove_mui)).
+    ///
+    /// The walk is read-only and takes no caller lock. The removals then run
+    /// in chunks of `chunk` prefixes, each inside `lock()` (the caller's
+    /// serialization of withdrawn-index writes, e.g. a mutex guard it
+    /// returns), and the muis leave the withdrawn index in one swap per
+    /// family at the end, also inside `lock()`. Between chunks the caller's
+    /// other writers proceed.
+    ///
+    /// Returns `(records_removed, prefixes_emptied)` summed over IPv4 and IPv6.
+    pub fn remove_muis<G>(
+        &self,
+        muis: &RoaringBitmap,
+        chunk: usize,
+        mut lock: impl FnMut() -> G,
+    ) -> Result<(usize, usize), PrefixStoreError> {
+        let chunk = chunk.max(1);
+        let mut records = 0;
+        let mut emptied = 0;
+
+        let v4 = self.v4.find_mui_records(muis)?;
+        for part in v4.chunks(chunk) {
+            let _held = lock();
+            let (r, e) = self.v4.remove_mui_records(part)?;
+            records += r;
+            emptied += e;
+        }
+        drop(v4);
+        let v6 = self.v6.find_mui_records(muis)?;
+        for part in v6.chunks(chunk) {
+            let _held = lock();
+            let (r, e) = self.v6.remove_mui_records(part)?;
+            records += r;
+            emptied += e;
+        }
+        drop(v6);
+
+        let _held = lock();
+        self.v4.mark_muis_as_active(muis)?;
+        self.v6.mark_muis_as_active(muis)?;
+
+        Ok((records, emptied))
+    }
+
+    /// Mark every one of `muis` as withdrawn in both address families, one
+    /// bitmap copy and swap per family instead of one per mui. Callers
+    /// serialize it like [`mark_mui_as_withdrawn_v4`](Self::mark_mui_as_withdrawn_v4).
+    pub fn mark_muis_as_withdrawn(
+        &self,
+        muis: &RoaringBitmap,
+    ) -> Result<(), PrefixStoreError> {
+        self.v4.mark_muis_as_withdrawn(muis)?;
+        self.v6.mark_muis_as_withdrawn(muis)
     }
 
     /// Request whether the global status for IPv4 prefixes and the specified

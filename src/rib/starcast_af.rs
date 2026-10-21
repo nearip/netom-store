@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use inetnum::addr::Prefix;
+use roaring::RoaringBitmap;
 use log::{info, trace};
 
 use crate::prefix_record::Meta;
@@ -119,6 +120,7 @@ impl<
     ) -> Result<UpsertReport, PrefixStoreError> {
         trace!("try insertingf {:?}", prefix);
         let guard = &epoch::pin();
+        let report_mui = record.multi_uniq_id;
         self.tree_bitmap
             .set_prefix_exists(prefix, record.multi_uniq_id)
             .and_then(|(retry_count, exists)| {
@@ -137,6 +139,15 @@ impl<
                     if !exists {
                         self.counters.inc_prefixes_count(prefix.len());
                         report.prefix_new = true;
+                    } else if !self.tree_bitmap.prefix_exists(prefix) {
+                        // A removal cleared the bit between our set and our
+                        // upsert (see `remove_mui_records`): set it again.
+                        if let Ok((_, false)) = self
+                            .tree_bitmap
+                            .set_prefix_exists(prefix, report_mui)
+                        {
+                            self.counters.inc_prefixes_count(prefix.len());
+                        }
                     }
                     report
                 })
@@ -214,6 +225,110 @@ impl<
         self.tree_bitmap.mark_mui_as_active(mui, guard)?;
 
         Ok((records_removed, prefixes_emptied))
+    }
+
+    // The prefixes holding a record of any of `muis`, with which of them, in
+    // one walk of this address family. Read-only: it needs no caller lock,
+    // and it pins a fresh epoch guard per prefix, so a walk over ~1e6
+    // prefixes never holds back the epoch (and every thread's deferred
+    // garbage) for its whole duration.
+    pub(crate) fn find_mui_records(
+        &self,
+        muis: &RoaringBitmap,
+    ) -> Result<Vec<(PrefixId<AF>, Vec<u32>)>, PrefixStoreError> {
+        let mut targets = Vec::new();
+        if muis.is_empty() {
+            return Ok(targets);
+        }
+        let default_route_id =
+            PrefixId::new(<AF as AddressFamily>::zero(), 0);
+        let default_route = if self.tree_bitmap.prefix_exists(default_route_id)
+        {
+            Some(default_route_id)
+        } else {
+            None
+        };
+        for prefix in default_route.into_iter().chain(
+            self.tree_bitmap.more_specific_prefix_iter_from(
+                PrefixId::new(<AF as AddressFamily>::zero(), 0),
+            ),
+        ) {
+            let guard = &epoch::pin();
+            let Some(records) = self
+                .get_value(prefix, None, true, guard)
+                .map_err(|_| PrefixStoreError::FatalError)?
+            else {
+                continue;
+            };
+            let hit: Vec<u32> = records
+                .iter()
+                .map(|r| r.multi_uniq_id)
+                .filter(|m| muis.contains(*m))
+                .collect();
+            if !hit.is_empty() {
+                targets.push((prefix, hit));
+            }
+        }
+        Ok(targets)
+    }
+
+    // Physically remove the records found by `find_mui_records`. Returns
+    // `(records_removed, prefixes_emptied)`.
+    //
+    // An insert sets the prefix's existence bit before it stores its record,
+    // so it can land between this removing the last record and clearing the
+    // bit; the bit is set again when the prefix holds records after it was
+    // cleared, and the prefix count follows what the bit operations report.
+    pub(crate) fn remove_mui_records(
+        &self,
+        targets: &[(PrefixId<AF>, Vec<u32>)],
+    ) -> Result<(usize, usize), PrefixStoreError> {
+        let mut records_removed = 0;
+        let mut prefixes_emptied = 0;
+
+        for (prefix, hit) in targets {
+            let mut emptied = false;
+            for &mui in hit {
+                let (removed, now_empty) = self
+                    .prefix_cht
+                    .remove_mui_for_prefix(*prefix, mui)
+                    .map_err(|_| PrefixStoreError::FatalError)?;
+                if removed {
+                    records_removed += 1;
+                    self.counters.dec_routes_count();
+                }
+                emptied |= now_empty;
+            }
+            if emptied && self.tree_bitmap.set_prefix_absent(*prefix)? {
+                if self.prefix_cht.prefix_has_records(*prefix) {
+                    // A concurrent insert stored a record after the map
+                    // emptied: the prefix exists again.
+                    let (_, existed) =
+                        self.tree_bitmap.set_prefix_exists(*prefix, hit[0])?;
+                    if existed {
+                        continue;
+                    }
+                }
+                prefixes_emptied += 1;
+                self.counters.dec_prefixes_count(prefix.len());
+            }
+        }
+
+        Ok((records_removed, prefixes_emptied))
+    }
+
+    pub(crate) fn mark_muis_as_active(
+        &self,
+        muis: &RoaringBitmap,
+    ) -> Result<(), PrefixStoreError> {
+        self.tree_bitmap.mark_muis_as_active(muis, &epoch::pin())
+    }
+
+    pub(crate) fn mark_muis_as_withdrawn(
+        &self,
+        muis: &RoaringBitmap,
+    ) -> Result<(), PrefixStoreError> {
+        self.tree_bitmap.mark_muis_as_withdrawn(muis, &epoch::pin())
     }
 
     fn upsert_prefix(

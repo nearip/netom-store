@@ -223,7 +223,7 @@ use crate::stats::Counters;
 use crate::types::{BitSpan, PrefixId};
 #[cfg(test)]
 use crate::IPv6;
-use crossbeam_epoch::{Atomic, Guard, Owned, Shared};
+use crossbeam_epoch::{Atomic, Guard, Owned};
 use log::{debug, error, log_enabled, trace};
 use node_cht::{NodeCht, NodeSet, StoredNode};
 use roaring::RoaringBitmap;
@@ -587,14 +587,9 @@ Giving up this node. This shouldn't happen!",
         mui: u32,
         guard: &Guard,
     ) -> Result<(), PrefixStoreError> {
-        let current = self.withdrawn_muis_bmin.load(Ordering::Acquire, guard);
-
-        let mut new = unsafe { current.as_ref() }
-            .ok_or(PrefixStoreError::StoreNotReadyError)?
-            .clone();
-
-        new.remove(mui);
-        self.update_withdrawn_muis_bmin(current, new, guard)
+        self.update_withdrawn_muis_bmin(|b| {
+            b.remove(mui);
+        }, guard)
     }
 
     pub fn mark_mui_as_withdrawn(
@@ -602,24 +597,56 @@ Giving up this node. This shouldn't happen!",
         mui: u32,
         guard: &Guard,
     ) -> Result<(), PrefixStoreError> {
-        let current = self.withdrawn_muis_bmin.load(Ordering::Acquire, guard);
-
-        let mut new = unsafe { current.as_ref() }
-            .ok_or(PrefixStoreError::StoreNotReadyError)?
-            .clone();
-
-        new.insert(mui);
-
-        self.update_withdrawn_muis_bmin(current, new, guard)
+        self.update_withdrawn_muis_bmin(|b| {
+            b.insert(mui);
+        }, guard)
     }
 
-    pub(crate) fn update_withdrawn_muis_bmin<'a>(
+    /// [`mark_mui_as_active`](Self::mark_mui_as_active) for many muis with
+    /// one copy of the bitmap and one swap, instead of one of each per mui.
+    pub fn mark_muis_as_active(
         &self,
-        current: Shared<'a, RoaringBitmap>,
-        mut new: RoaringBitmap,
-        guard: &'a Guard,
+        muis: &RoaringBitmap,
+        guard: &Guard,
     ) -> Result<(), PrefixStoreError> {
+        if muis.is_empty() {
+            return Ok(());
+        }
+        self.update_withdrawn_muis_bmin(|b| *b -= muis, guard)
+    }
+
+    /// [`mark_mui_as_withdrawn`](Self::mark_mui_as_withdrawn) for many muis
+    /// with one copy of the bitmap and one swap.
+    pub fn mark_muis_as_withdrawn(
+        &self,
+        muis: &RoaringBitmap,
+        guard: &Guard,
+    ) -> Result<(), PrefixStoreError> {
+        if muis.is_empty() {
+            return Ok(());
+        }
+        self.update_withdrawn_muis_bmin(|b| *b |= muis, guard)
+    }
+
+    /// Replace the withdrawn-muis bitmap with a modified copy (`modify`
+    /// applied to a clone of the current one), retrying on contention.
+    ///
+    /// On a lost race the change is applied again to the bitmap that won,
+    /// and the next attempt compares against that one. The previous version
+    /// re-cloned the winner without re-applying the change and kept comparing
+    /// against the stale pointer, so a lost race could never succeed: the
+    /// "unbounded CAS livelock" callers serialize around.
+    pub(crate) fn update_withdrawn_muis_bmin(
+        &self,
+        modify: impl Fn(&mut RoaringBitmap),
+        guard: &Guard,
+    ) -> Result<(), PrefixStoreError> {
+        let mut current = self.withdrawn_muis_bmin.load(Ordering::Acquire, guard);
         loop {
+            let mut new = unsafe { current.as_ref() }
+                .ok_or(PrefixStoreError::StoreNotReadyError)?
+                .clone();
+            modify(&mut new);
             match self.withdrawn_muis_bmin.compare_exchange(
                 current,
                 Owned::new(new),
@@ -635,11 +662,7 @@ Giving up this node. This shouldn't happen!",
                     unsafe { guard.defer_destroy(current) };
                     return Ok(());
                 }
-                Err(updated) => {
-                    new = unsafe { updated.current.as_ref() }
-                        .ok_or(PrefixStoreError::StoreNotReadyError)?
-                        .clone();
-                }
+                Err(lost) => current = lost.current,
             }
         }
     }

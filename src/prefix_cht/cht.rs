@@ -295,6 +295,11 @@ impl<M: Send + Sync + Debug + Display + Meta> MultiMap<M> {
         }
         Ok((removed, now_empty))
     }
+
+    pub(crate) fn is_empty(&self) -> FatalResult<bool> {
+        let (record_map, _retry_count) = self.acquire_write_lock()?;
+        Ok(record_map.is_empty())
+    }
 }
 #[derive(Clone, Debug)]
 pub(crate) struct MultiMapValue<M> {
@@ -868,6 +873,16 @@ impl<AF: AddressFamily, M: Meta, const ROOT_SIZE: usize>
             Ok((removed, now_empty))
         } else {
             Ok((false, false))
+        }
+    }
+
+    /// Whether the prefix holds any record, withdrawn ones included.
+    pub(crate) fn prefix_has_records(&self, prefix: PrefixId<AF>) -> bool {
+        match self.non_recursive_retrieve_prefix(prefix) {
+            (Some(stored_prefix), _) => {
+                !stored_prefix.record_map.is_empty().unwrap_or(true)
+            }
+            _ => false,
         }
     }
 
