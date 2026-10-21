@@ -894,6 +894,33 @@ impl<'a, M: Meta, C: Config> StarCastRib<M, C> {
         Ok((records, emptied))
     }
 
+    /// Physically remove the record `mui` holds for `prefix`, if any: the
+    /// one-record counterpart of [`remove_muis`](Self::remove_muis), with no
+    /// walk. Returns whether a record was removed. Callers serialize it like
+    /// the other removals.
+    pub fn remove_record(
+        &self,
+        prefix: &Prefix,
+        mui: u32,
+    ) -> Result<bool, PrefixStoreError> {
+        match prefix.addr() {
+            std::net::IpAddr::V4(addr) => self.v4.remove_record(
+                PrefixId::<IPv4>::new(
+                    <IPv4 as AddressFamily>::from_ipaddr(addr),
+                    prefix.len(),
+                ),
+                mui,
+            ),
+            std::net::IpAddr::V6(addr) => self.v6.remove_record(
+                PrefixId::<IPv6>::new(
+                    <IPv6 as AddressFamily>::from_ipaddr(addr),
+                    prefix.len(),
+                ),
+                mui,
+            ),
+        }
+    }
+
     /// Mark every one of `muis` as withdrawn in both address families, one
     /// bitmap copy and swap per family instead of one per mui. Callers
     /// serialize it like [`mark_mui_as_withdrawn_v4`](Self::mark_mui_as_withdrawn_v4).

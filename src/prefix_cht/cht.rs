@@ -683,10 +683,12 @@ impl<AF: AddressFamily, M: Meta, const ROOT_SIZE: usize>
                         .upsert_record(record)
                         .map_err(|_| PrefixStoreError::FatalError)?;
 
-                    // if the mui is new, we didn't overwrite an existing
-                    // route, so that's a new one!
-                    if mui_count.is_none() {
-                        mui_is_new = true;
+                    // The mui is new only if it held no record here: an
+                    // overwrite of an existing record is not a new route.
+                    // This used to start `true` and only ever set it true,
+                    // so every overwrite reported a new route.
+                    mui_is_new = mui_count.is_none();
+                    if mui_is_new {
                         self.counters.inc_routes_count();
                     };
 

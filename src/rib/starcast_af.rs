@@ -317,6 +317,17 @@ impl<
         Ok((records_removed, prefixes_emptied))
     }
 
+    // Physically remove one record, the (prefix, mui) one. Returns whether a
+    // record was removed. O(1): no walk.
+    pub(crate) fn remove_record(
+        &self,
+        prefix: PrefixId<AF>,
+        mui: u32,
+    ) -> Result<bool, PrefixStoreError> {
+        let (removed, _) = self.remove_mui_records(&[(prefix, vec![mui])])?;
+        Ok(removed > 0)
+    }
+
     pub(crate) fn mark_muis_as_active(
         &self,
         muis: &RoaringBitmap,
