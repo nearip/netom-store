@@ -36,8 +36,7 @@ use crate::{
 /// `FxBuildHasher` instead of the default SipHash: the keys are internal `u32`
 /// mui values (no DoS-resistance needed), and SipHash on a u32 showed up as
 /// ~4-5% of CPU on the upsert path (`hash_one`) under load.
-type RecordMap<M> =
-    HashMap<u32, MultiMapValue<M>, rustc_hash::FxBuildHasher>;
+type RecordMap<M> = HashMap<u32, MultiMapValue<M>, rustc_hash::FxBuildHasher>;
 
 #[derive(Debug)]
 pub struct MultiMap<M: Meta>(Arc<Mutex<RecordMap<M>>>);
@@ -67,9 +66,7 @@ impl<M: Send + Sync + Debug + Display + Meta> MultiMap<M> {
         }
     }
 
-    fn acquire_read_guard(
-        &self,
-    ) -> MutexGuard<RecordMap<M>> {
+    fn acquire_read_guard(&self) -> MutexGuard<RecordMap<M>> {
         let backoff = Backoff::new();
 
         loop {
@@ -100,6 +97,49 @@ impl<M: Send + Sync + Debug + Display + Meta> MultiMap<M> {
                 None
             }
         })
+    }
+
+    // The callback only borrows metadata; clone accepted records once, while
+    // retaining the legacy per-prefix iteration order and status semantics.
+    pub(crate) fn get_records_filtered(
+        &self,
+        mui: Option<u32>,
+        include_withdrawn: bool,
+        bmin: &RoaringBitmap,
+        accept: &mut impl FnMut(u32, RouteStatus, &M) -> bool,
+    ) -> Option<Vec<Record<M>>> {
+        let map = self.acquire_read_guard();
+        let mut present = false;
+        let mut out = Vec::new();
+        let mut visit = |id, value: &MultiMapValue<M>| {
+            let status = if include_withdrawn && bmin.contains(id) {
+                RouteStatus::Withdrawn
+            } else {
+                value.route_status()
+            };
+            if !include_withdrawn
+                && (status != RouteStatus::Active
+                    || (mui.is_none() && bmin.contains(id)))
+            {
+                return;
+            }
+            present = true;
+            if accept(id, status, value.meta()) {
+                let mut record = Record::from((id, value));
+                record.status = status;
+                out.push(record);
+            }
+        };
+        if let Some(id) = mui {
+            if let Some(value) = map.get(&id) {
+                visit(id, value);
+            }
+        } else {
+            for (&id, value) in map.iter() {
+                visit(id, value);
+            }
+        }
+        present.then_some(out)
     }
 
     pub fn best_backup(&self, tbi: M::TBI) -> (Option<u32>, Option<u32>) {
@@ -565,6 +605,24 @@ impl<AF: AddressFamily, M: Meta, const ROOT_SIZE: usize>
             bush: <Cht<PrefixSet<AF, M>, ROOT_SIZE, 1>>::init(),
             counters: Counters::default(),
         }
+    }
+
+    pub(crate) fn get_records_for_prefix_filtered(
+        &self,
+        prefix: PrefixId<AF>,
+        mui: Option<u32>,
+        include_withdrawn: bool,
+        bmin: &RoaringBitmap,
+        accept: &mut impl FnMut(u32, RouteStatus, &M) -> bool,
+    ) -> Option<Vec<Record<M>>> {
+        self.non_recursive_retrieve_prefix(prefix).0.and_then(|p| {
+            p.record_map.get_records_filtered(
+                mui,
+                include_withdrawn,
+                bmin,
+                accept,
+            )
+        })
     }
 
     pub(crate) fn get_records_for_prefix(

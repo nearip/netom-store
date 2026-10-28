@@ -83,6 +83,35 @@ impl<
         }
     }
 
+    pub(crate) fn get_value_filtered(
+        &'a self,
+        prefix: PrefixId<AF>,
+        mui: Option<u32>,
+        include_withdrawn: bool,
+        guard: &'a Guard,
+        accept: &mut impl FnMut(u32, crate::types::RouteStatus, &M) -> bool,
+    ) -> FatalResult<Option<Vec<Record<M>>>> {
+        if self.persist_strategy() == PersistStrategy::PersistOnly {
+            return self
+                .get_value(prefix, mui, include_withdrawn, guard)
+                .map(|v| {
+                    v.map(|mut records| {
+                        records.retain(|r| {
+                            accept(r.multi_uniq_id, r.status, &r.meta)
+                        });
+                        records
+                    })
+                });
+        }
+        Ok(self.prefix_cht.get_records_for_prefix_filtered(
+            prefix,
+            mui,
+            include_withdrawn,
+            self.tree_bitmap.withdrawn_muis_bmin(guard),
+            accept,
+        ))
+    }
+
     pub(crate) fn more_specifics_from(
         &'a self,
         prefix_id: PrefixId<AF>,
@@ -198,11 +227,12 @@ impl<
             })
     }
 
-    pub(crate) fn match_prefix(
+    pub(crate) fn match_prefix_filtered(
         &'a self,
         search_pfx: PrefixId<AF>,
         options: &MatchOptions,
         guard: &'a Guard,
+        accept: &mut impl FnMut(u32, crate::types::RouteStatus, &M) -> bool,
     ) -> FatalResult<QueryResult<M>> {
         trace!("match_prefix rib {:?} {:?}", search_pfx, options);
         let res = self.tree_bitmap.match_prefix(search_pfx, options);
@@ -211,15 +241,13 @@ impl<
         let mut res = QueryResult::from(res);
 
         if let Some(Ok(Some(m))) = res.prefix.map(|p| {
-            self.get_value(
+            self.get_value_filtered(
                 p.into(),
                 options.mui,
                 options.include_withdrawn,
                 guard,
+                accept,
             )
-            .map(|res| {
-                res.and_then(|v| if v.is_empty() { None } else { Some(v) })
-            })
         }) {
             res.records = m;
         } else {
@@ -233,11 +261,12 @@ impl<
                 .map(|p| {
                     p.iter()
                         .filter_map(|mut r| {
-                            if let Ok(mm) = self.get_value(
+                            if let Ok(mm) = self.get_value_filtered(
                                 r.prefix.into(),
                                 options.mui,
                                 options.include_withdrawn,
                                 guard,
+                                accept,
                             ) {
                                 if let Some(m) = mm {
                                     r.meta = m;
@@ -259,11 +288,12 @@ impl<
                 .map(|p| {
                     p.iter()
                         .filter_map(|mut r| {
-                            if let Ok(mm) = self.get_value(
+                            if let Ok(mm) = self.get_value_filtered(
                                 r.prefix.into(),
                                 options.mui,
                                 options.include_withdrawn,
                                 guard,
+                                accept,
                             ) {
                                 if let Some(m) = mm {
                                     r.meta = m;

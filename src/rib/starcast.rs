@@ -1,7 +1,7 @@
 use crossbeam_epoch::Guard;
 use inetnum::addr::Prefix;
-use roaring::RoaringBitmap;
 use rand::prelude::*;
+use roaring::RoaringBitmap;
 
 use crate::{
     epoch,
@@ -124,22 +124,41 @@ impl<'a, M: Meta, C: Config> StarCastRib<M, C> {
         options: &MatchOptions,
         guard: &'a Guard,
     ) -> FatalResult<QueryResult<M>> {
+        self.match_prefix_filtered(
+            search_pfx,
+            options,
+            guard,
+            &mut |_, _, _| true,
+        )
+    }
+
+    /// Filter borrowed records before cloning results. The callback must be
+    /// short and synchronous: it runs under a single prefix's record lock.
+    pub fn match_prefix_filtered(
+        &'a self,
+        search_pfx: &Prefix,
+        options: &MatchOptions,
+        guard: &'a Guard,
+        accept: &mut impl FnMut(u32, crate::types::RouteStatus, &M) -> bool,
+    ) -> FatalResult<QueryResult<M>> {
         match search_pfx.addr() {
-            std::net::IpAddr::V4(addr) => self.v4.match_prefix(
+            std::net::IpAddr::V4(addr) => self.v4.match_prefix_filtered(
                 PrefixId::<IPv4>::new(
                     <IPv4 as AddressFamily>::from_ipaddr(addr),
                     search_pfx.len(),
                 ),
                 options,
                 guard,
+                accept,
             ),
-            std::net::IpAddr::V6(addr) => self.v6.match_prefix(
+            std::net::IpAddr::V6(addr) => self.v6.match_prefix_filtered(
                 PrefixId::<IPv6>::new(
                     <IPv6 as AddressFamily>::from_ipaddr(addr),
                     search_pfx.len(),
                 ),
                 options,
                 guard,
+                accept,
             ),
         }
     }
@@ -615,9 +634,7 @@ impl<'a, M: Meta, C: Config> StarCastRib<M, C> {
     /// Request a guard-free iterator over all prefix *keys* (IPv4 then IPv6).
     ///
     /// See [`Self::prefixes_keys_iter_v4`].
-    pub fn prefixes_keys_iter(
-        &'a self,
-    ) -> impl Iterator<Item = Prefix> + 'a {
+    pub fn prefixes_keys_iter(&'a self) -> impl Iterator<Item = Prefix> + 'a {
         self.v4
             .prefixes_keys_iter()
             .chain(self.v6.prefixes_keys_iter())
@@ -1092,6 +1109,35 @@ impl<'a, M: Meta, C: Config> StarCastRib<M, C> {
                 include_withdrawn,
                 guard,
             ),
+        }
+    }
+
+    /// Fetch only records accepted by a borrowing predicate. No lock or epoch
+    /// guard escapes this call; consumers can write the returned batch safely.
+    pub fn get_records_for_prefix_filtered(
+        &self,
+        prefix: &Prefix,
+        mui: Option<u32>,
+        include_withdrawn: bool,
+        accept: &mut impl FnMut(u32, crate::types::RouteStatus, &M) -> bool,
+    ) -> FatalResult<Option<Vec<Record<M>>>> {
+        let guard = &epoch::pin();
+        if prefix.is_v4() {
+            self.v4.get_value_filtered(
+                (*prefix).into(),
+                mui,
+                include_withdrawn,
+                guard,
+                accept,
+            )
+        } else {
+            self.v6.get_value_filtered(
+                (*prefix).into(),
+                mui,
+                include_withdrawn,
+                guard,
+                accept,
+            )
         }
     }
 
